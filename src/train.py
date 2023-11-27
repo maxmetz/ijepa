@@ -245,6 +245,31 @@ def main(args, resume_preempt=False):
             next(momentum_scheduler)
             mask_collator.step()
 
+    class FullGatherLayer(torch.autograd.Function):
+        """
+        Gather tensors from all process and support backward propagation
+        for the gradients across processes.
+        """
+
+        @staticmethod
+        def forward(ctx, x):
+            output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+            dist.all_gather(output, x)
+            return tuple(output)
+
+        @staticmethod
+        def backward(ctx, *grads):
+            all_gradients = torch.stack(grads)
+            dist.all_reduce(all_gradients)
+            return all_gradients[dist.get_rank()]
+
+    def handle_sigusr1(signum, frame):
+        os.system(f'scontrol requeue {os.environ["SLURM_JOB_ID"]}')
+        exit()
+
+    def handle_sigterm(signum, frame):
+        pass
+
     def save_checkpoint(epoch):
         save_dict = {
             'encoder': encoder.state_dict(),
@@ -307,9 +332,42 @@ def main(args, resume_preempt=False):
                     z = predictor(z, masks_enc, masks_pred)
                     return z
 
+                def off_diagonal(x):
+                    n, m = x.shape
+                    assert n == m
+                    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
                 def loss_fn(z, h):
                     loss = F.smooth_l1_loss(z, h)
                     loss = AllReduce.apply(loss)
+
+                    return loss
+                def loss_fn2(z, h):
+                    num_features = z.shape[-1]
+                    loss = F.smooth_l1_loss(z, h)
+                    repr_loss = AllReduce.apply(loss)
+
+                    x = torch.cat(FullGatherLayer.apply(z), dim=0)
+                    y = torch.cat(FullGatherLayer.apply(h), dim=0)
+                    x = x - x.mean(dim=0)
+                    y = y - y.mean(dim=0)
+
+                    std_x = torch.sqrt(x.var(dim=0) + 0.0001)
+                    std_y = torch.sqrt(y.var(dim=0) + 0.0001)
+                    std_loss = torch.mean(F.relu(1 - std_x)) / 2 + torch.mean(F.relu(1 - std_y)) / 2
+
+                    cov_x = (x.T @ x) / (batch_size - 1)
+                    cov_y = (y.T @ y) / (batch_size - 1)
+                    cov_loss = off_diagonal(cov_x).pow_(2).sum().div(
+                        num_features
+                    ) + off_diagonal(cov_y).pow_(2).sum().div(num_features)
+
+
+
+                    loss = (
+                            25.0 * repr_loss
+                            + 25.0 * std_loss
+                            + 1.0 * cov_loss
+                    )
                     return loss
 
                 # Step 1. Forward
